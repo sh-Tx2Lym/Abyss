@@ -404,6 +404,7 @@ private:
     size_t dt_dense_map_bytes_ = 0;
     bool dt_build(std::string& why);                       // (prefill_setup) the rows, the buffer, the patches
     bool dt_layer_in(int il, cudaStream_t s, std::string& err);   // (prefill_half) layer il's rows -> the buffer
+    void a21_test_hooks(bool before);   // A-21 tests: fills, guards, the layout and the lent slots (prefill)
     bool dt_restore(std::string& err);                     // (prefill_return) all rows home, F->L back
     // state and scratch arenas (device), carved in load(); see glm_model.cpp for the layout
     float* state_ = nullptr;

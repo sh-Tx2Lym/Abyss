@@ -631,6 +631,10 @@ struct Glm5Model::PrefillState {
     bool v41_eng_gemm = false;       // deepseek41: Engram's engram_kv as a GEMM over a block (prefill_v41_engram_block)
     uint8_t* region = nullptr;       // the pool's lendable tail
     size_t region_bytes = 0;
+    // A-21 tests (STRATA_GLM_PREFILL_GUARD_MB / _DENSE_TIER_FILL / _LAYOUT): the guards carved around the buffers, the dense side used
+    struct Guard { uint8_t* p; size_t n; const char* name; };
+    std::vector<Guard> guards;
+    size_t dt_used = 0;
     int T_bound = 0;                 // the chunk the pointers are carved for (<= T)
     int sub = kSub;                  // ... and its mixer sub-batch (mixer_sub)
     size_t need = 0;                 // ... and the bytes of the region that layout uses
@@ -1822,7 +1826,14 @@ size_t Glm5Model::prefill_carve(int Tn) {
     const auto [pers, uni] = prefill_bytes_for(T);
     Carve c{S->region};
     if (F->nv_guard > 0) c.take<uint8_t>(F->nv_guard);   // (NVFP4: the region starts with a guard - nv_zero_staging)
+    // A-21 test: STRATA_GLM_PREFILL_GUARD_MB=<n> - n MB guards before and after the activations (pool side) and before
+    // and after the other buffers (the dense rows' side, or the pool's without the tier); prefill() fills them with
+    // 0xA5 once the region is the prompt's and reports any byte a prompt changed (a write past a buffer, or into it)
+    static const size_t guard_b = [] { const char* v = getenv("STRATA_GLM_PREFILL_GUARD_MB"); return v ? (size_t) std::atoll(v) << 20 : 0; }();
+    S->guards.clear();
+    if (guard_b) S->guards.push_back({c.take<uint8_t>(guard_b), guard_b, "pool: before the activations"});
     S->arena = c.take<uint8_t>(pers + uni);
+    if (guard_b) S->guards.push_back({c.take<uint8_t>(guard_b), guard_b, "pool: after the activations"});
     // A-21: a chunk longer than the plain layout's takes its other buffers from the dense rows (dt_build's range
     // before the one-layer buffer); the pool lends the activations alone
     // (=2: every prompt, a short one too - the same chunks as without it, for an exact comparison)
@@ -1830,6 +1841,7 @@ size_t Glm5Model::prefill_carve(int Tn) {
     S->dt_on = dt_ready_ && S->T_tier > 0 && (Tn > S->T_base || dt_force);
     Carve dc{(uint8_t*) w_arena_};
     Carve& o = S->dt_on ? dc : c;
+    if (guard_b) S->guards.push_back({o.take<uint8_t>(guard_b), guard_b, S->dt_on ? "dense: before w16" : "pool: before w16"});
     S->w16 = o.take<uint16_t>((size_t) S->w16_elems);
     S->w32 = o.take<float>((size_t) S->w32_elems);
     S->ws = o.take<uint8_t>(S->ws_bytes);
@@ -1846,6 +1858,8 @@ size_t Glm5Model::prefill_carve(int Tn) {
         S->pbuf_carved = slots * S->gstride;
     }
     S->pbuf = S->pbuf_carved ? o.take<uint8_t>(S->pbuf_carved + F->nv_guard) : nullptr;   // (a short prompt: none)
+    if (guard_b) S->guards.push_back({o.take<uint8_t>(guard_b), guard_b, S->dt_on ? "dense: after pbuf" : "pool: after pbuf"});
+    S->dt_used = S->dt_on ? dc.off : 0;
     if (S->dt_on && dc.off > dt_buf_at_) {   // (choose sized it to fit: a guard, not a path)
         std::fprintf(stderr, "glm prefill: CUDA%d dense tier: %zu MB of buffers past the dense rows' %llu MB - off\n",
                      dev_, dc.off >> 20, (unsigned long long) (dt_buf_at_ >> 20));
@@ -2399,12 +2413,102 @@ bool Glm5Model::dt_layer_in(int il, cudaStream_t s, std::string& err) {
     }
     g_dt_host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     g_dt_bytes += off;
+    // STRATA_GLM_PREFILL_DENSE_TIER_POISON=N (a test): the buffer filled with 0xFF N times on s before the rows go up -
+    // a reader on s sees only the rows (in order), one on another stream that overlaps the switch reads NaN, so a race
+    // turns from "now and then" into "every run"; N widens the window (each fill ~0.2 ms)
+    static const int dt_poison = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER_POISON"); return v != nullptr ? std::atoi(v) : 0; }();
+    for (int k = 0; k < dt_poison; ++k) cudaMemsetAsync((uint8_t*) w_arena_ + dt_buf_at_, 0xFF, (size_t) dt_buf_bytes_, s);
     cudaMemcpyAsync((uint8_t*) w_arena_ + dt_buf_at_, dt_pin_, (size_t) off, cudaMemcpyHostToDevice, s);
     cudaEventRecord(dt_ev_, s);
     if (!glmfast::cuda_ok(cudaGetLastError(), "glm dense tier: a layer's rows", err)) return false;
     set(il, true);
     dt_cur_ = il;
     return true;
+}
+
+// A-21 tests, around prefill_run (before = true: the region is the prompt's, nothing of the prompt queued yet):
+//   STRATA_GLM_PREFILL_DENSE_TIER_FILL=1  the lent dense rows before the one-layer buffer -> 0xFF (=2: the pool's
+//                                         activations too) - a read of a byte nobody wrote turns into NaN every run
+//   STRATA_GLM_PREFILL_GUARD_MB=<n>       the guards (prefill_carve) and the dense rows' unused gap -> 0xA5; after
+//                                         the prompt, each one's changed bytes: count, first and last offset
+//   STRATA_GLM_PREFILL_LAYOUT=1           the buffers' offsets, and every pool slot under the carved bytes that is
+//                                         not kLent (before and after the prompt)
+void Glm5Model::a21_test_hooks(bool before) {
+    PrefillState* S = pf_;
+    FastState* F = fast_;
+    if (S == nullptr || F == nullptr) return;
+    static const int fill = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER_FILL"); return v ? std::atoi(v) : 0; }();
+    static const bool layout = [] { const char* v = getenv("STRATA_GLM_PREFILL_LAYOUT"); return v && std::atoi(v) != 0; }();
+    const bool guards = !S->guards.empty();
+    if (fill == 0 && !guards && !layout) return;
+    cudaSetDevice(dev_);
+    const cudaStream_t s = F->cs;
+    cudaDeviceSynchronize();
+    std::vector<PrefillState::Guard> gs = S->guards;
+    if (S->dt_on && S->dt_used < dt_buf_at_ && guards)
+        gs.push_back({(uint8_t*) w_arena_ + S->dt_used, (size_t) (dt_buf_at_ - S->dt_used), "dense: the unused gap before the buffer"});
+    const auto where = [&](const void* p) {
+        const uint8_t* q = (const uint8_t*) p;
+        char b[96];
+        if (q >= S->region && q < S->region + S->region_bytes) std::snprintf(b, sizeof b, "pool+%.1f MB", (double) (q - S->region) / 1048576.0);
+        else if (q >= (const uint8_t*) w_arena_ && q < (const uint8_t*) w_arena_ + dt_buf_at_ + dt_buf_bytes_)
+            std::snprintf(b, sizeof b, "dense+%.1f MB", (double) (q - (const uint8_t*) w_arena_) / 1048576.0);
+        else std::snprintf(b, sizeof b, "%p", p);
+        return std::string(b);
+    };
+    const auto slots = [&](const char* when) {   // pool slots under the carved bytes that are not kLent
+        const uint8_t* r0 = S->region;
+        const uint8_t* r1 = S->region + S->need;
+        int bad = 0, lent = 0;
+        std::lock_guard<std::mutex> lk(F->mu);
+        for (int il = l0_; il < lt_; ++il) {
+            const auto& P = F->lp[(size_t) il];
+            if (P.xbase == nullptr) continue;
+            for (int sl = 0; sl < P.n; ++sl) {
+                const uint8_t* p = P.slot_ptr(sl);
+                if (p + P.stride <= r0 || p >= r1) continue;
+                if (P.st[(size_t) sl] == FastState::kLent) { ++lent; continue; }
+                if (bad++ < 12)
+                    std::fprintf(stderr, "glm a21 layout (%s): layer %d slot %d (%s) is state %d, key %d, under the carve\n", when,
+                                 il, sl, where(p).c_str(), (int) P.st[(size_t) sl], P.key[(size_t) sl]);
+            }
+        }
+        std::fprintf(stderr, "glm a21 layout (%s): %d slots under the carved %.1f MB are lent, %d are not\n", when, lent,
+                     (double) S->need / 1048576.0, bad);
+    };
+    if (before) {
+        if (layout) {
+            std::fprintf(stderr, "glm a21 layout: T %d, tier %d | region %.1f MB, need %.1f MB | arena %s, R %s, x %s, mixer %s, ffn %s, "
+                                 "uni %s (%.1f MB) | w16 %s, w32 %s, ws %s, gbuf %s, pbuf %s (%.1f MB) | dense used %.1f MB, buffer at %.1f MB (%.1f MB)\n",
+                         S->T_bound, (int) S->dt_on, (double) S->region_bytes / 1048576.0, (double) S->need / 1048576.0,
+                         where(S->arena).c_str(), where(S->R).c_str(), where(S->x).c_str(), where(S->mixer).c_str(),
+                         where(S->ffn).c_str(), where(S->uni).c_str(), (double) S->uni_bytes / 1048576.0, where(S->w16).c_str(),
+                         where(S->w32).c_str(), where(S->ws).c_str(), S->gbuf ? where(S->gbuf).c_str() : "-",
+                         S->pbuf ? where(S->pbuf).c_str() : "-", (double) S->pbuf_carved / 1048576.0,
+                         (double) S->dt_used / 1048576.0, (double) dt_buf_at_ / 1048576.0, (double) dt_buf_bytes_ / 1048576.0);
+            slots("before");
+        }
+        if (fill >= 1 && S->dt_on) cudaMemsetAsync(w_arena_, 0xFF, (size_t) dt_buf_at_, s);
+        if (fill >= 2) cudaMemsetAsync(S->arena, 0xFF, (size_t) (S->uni + S->uni_bytes - S->arena), s);
+        for (const auto& gd : gs) cudaMemsetAsync(gd.p, 0xA5, gd.n, s);
+        cudaStreamSynchronize(s);
+        if (fill || guards)
+            std::fprintf(stderr, "glm a21 test: fill %d (dense %.1f MB%s), %zu guards set\n", fill,
+                         S->dt_on ? (double) dt_buf_at_ / 1048576.0 : 0.0, fill >= 2 ? " + the activations" : "", gs.size());
+        return;
+    }
+    std::vector<uint8_t> h;
+    for (const auto& gd : gs) {
+        h.resize(gd.n);
+        cudaMemcpy(h.data(), gd.p, gd.n, cudaMemcpyDeviceToHost);
+        size_t n = 0, first = SIZE_MAX, last = 0;
+        for (size_t i = 0; i < gd.n; ++i)
+            if (h[i] != 0xA5) { ++n; first = std::min(first, i); last = i; }
+        if (n == 0) std::fprintf(stderr, "glm a21 guard: %s (%s, %.1f MB) intact\n", gd.name, where(gd.p).c_str(), (double) gd.n / 1048576.0);
+        else std::fprintf(stderr, "glm a21 guard: %s (%s, %.1f MB) CHANGED: %zu bytes, from +%zu to +%zu\n", gd.name,
+                          where(gd.p).c_str(), (double) gd.n / 1048576.0, n, first, last);
+    }
+    if (layout) slots("after");
 }
 
 bool Glm5Model::dt_restore(std::string& err) {
@@ -6546,7 +6650,9 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         progress_at("the prompt: STRATA_GLM_STALL_TEST's pause");
         std::this_thread::sleep_for(std::chrono::seconds(stall_test));
     }
+    if (ok) a21_test_hooks(true);
     if (ok) ok = prefill_run(tokens, err);
+    if (ok) a21_test_hooks(false);
     progress_at("the prompt: returning the expert pool's tail");
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         std::string return_err;
