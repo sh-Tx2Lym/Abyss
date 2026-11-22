@@ -392,7 +392,10 @@ private:
     struct DtRow { int il; uint64_t at, n; const uint8_t* src; std::string name; };
     struct DtPatch { uint32_t off; uintptr_t orig, moved; };   // a pointer word inside F->L[il]: its two values
     std::vector<DtRow> dt_rows_;                           // every raw row uploaded (pack), in arena order
+    std::vector<std::vector<uint8_t>> dt_host_;            // host copies of the rows converted at load (FP32), their src
     uint64_t dt_end_ = 0;                                  // [0, dt_end_) of w_arena_: restorable blk rows only
+    uint64_t dt_lo_ = 0;                                   // the lent range's start: past the arena's leading non-blk
+                                                           // rows (qwen35moe packs output.weight first), 0 on deepseek41
     uint64_t dt_buf_at_ = 0, dt_buf_bytes_ = 0;            // the one-layer buffer at the end of that range
     std::vector<std::vector<int>> dt_layer_rows_;          // per layer: its rows (indices into dt_rows_)
     std::vector<std::vector<DtPatch>> dt_patch_;           // per layer: the pointer words to move

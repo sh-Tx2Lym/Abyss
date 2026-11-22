@@ -576,6 +576,11 @@ struct Glm5Model::PrefillState {
     int64_t T_base = 0, T_tier = 0;
     int NP_tier = 0;
     bool dt_on = false;
+    // where the tier's chunk puts its three parts, a bit each set = in the dense rows: 1 the activations' per-row part
+    // (R, x, mixer, ffn, ...), 2 their shared part (uni), 4 the rest (weight scratch, staging, prestage).  4: the
+    // prototype's layout; STRATA_GLM_PREFILL_DENSE_TIER_ACT=1 tries every split and keeps the longest chunk
+    int dt_mask = 4;
+    size_t pers_bytes = 0;
     // --prefill: the chunk and its prestage slots for a lend cap (% of the pool's slots), the cap it was sized with,
     // whether the measured pinned share may still lower it (prefill_settle), and how it reads in the log
     std::function<std::pair<int64_t, int>(int64_t)> choose;
@@ -1258,13 +1263,13 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     // prompts 2,177-2,186 -> 2,305-2,309 tok/s, 8K about even); STRATA_GLM_PRESTAGE=<slots>, 0 none
     int ring_max = has_moe ? kPreSlots : 0;
     if (const char* v = getenv("STRATA_GLM_PRESTAGE")) ring_max = has_moe ? std::max(0, std::atoi(v)) : 0;
-    // A-21: the dense tier (STRATA_GLM_PREFILL_DENSE_TIER=1) - deepseek41 on one device only
+    // A-21: the dense tier (STRATA_GLM_PREFILL_DENSE_TIER=1) - deepseek41 or qwen35moe on one device only
     {
         static const bool dt_env = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER"); return v != nullptr && std::atoi(v) != 0; }();
         dt_ready_ = false;
         if (dt_env) {
             std::string why;
-            if (!g.v41) why = "not deepseek41";
+            if (!g.v41 && !(g.qwen35() && !g.q35_dense())) why = "not deepseek41 or qwen35moe";
             else if (n_parts_ != 1 || split_next_ != nullptr || l0_ != 0) why = "a split";
             else if (F->nv_guard > 0) why = "NVFP4 guards";
             else if (F->unified_memory) why = "unified memory";
@@ -1395,13 +1400,14 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
         S->T_base = T;
         S->T_tier = 0;
         S->NP_tier = 0;
+        S->dt_mask = 4;
         if (dt_ready_ && is_auto && T > 0 && stride_sum > 0 && gstride > 0) {
             Carve o;
             o.take<uint16_t>((size_t) w16_elems);
             o.take<float>((size_t) w32_elems);
             o.take<uint8_t>(ws_bytes);
             o.take<uint8_t>(gbuf);
-            const size_t D = (size_t) dt_buf_at_;
+            const size_t D = (size_t) (dt_buf_at_ - dt_lo_);   // (the dense side: from dt_lo_ to the buffer)
             if (o.off + 256 <= D) {
                 const auto act = [&](int64_t TT) {
                     const auto pu = prefill_bytes_for((size_t) TT);
@@ -1419,11 +1425,65 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
                         hi = mid - 1;
                     }
                 }
+                S->dt_mask = 4;
                 if (best > T) {
                     S->T_tier = best;
                     const int64_t rr = best >= kPreMinT ? std::min<int64_t>(ring_max, (int64_t) ((D - o.off - 256) / gstride)) : 0;
                     S->NP_tier = rr >= kRingMin ? (int) rr : 0;
                 }
+            }
+            // A-21 test: STRATA_GLM_PREFILL_DENSE_TIER_ACT=1 - the activations' two parts may go to the dense rows too
+            // (a model whose other buffers are small - qwen35moe - leaves most of the lent rows unused otherwise): every
+            // split of {per-row, shared, the rest} over the pool and the dense rows, the full prestage beside the rest,
+            // the longest chunk kept
+            static const bool dt_act = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER_ACT"); return v != nullptr && std::atoi(v) != 0; }();
+            if (dt_act) {
+                const auto fits = [&](int m, int64_t TT) {
+                    const auto pu = prefill_bytes_for((size_t) TT);
+                    Carve p, d;
+                    if ((m & 3) == 0) p.take<uint8_t>(pu.first + pu.second);
+                    else if ((m & 3) == 3) d.take<uint8_t>(pu.first + pu.second);
+                    else {
+                        ((m & 1) ? d : p).take<uint8_t>(pu.first);
+                        ((m & 2) ? d : p).take<uint8_t>(pu.second);
+                    }
+                    Carve& q = (m & 4) ? d : p;
+                    q.take<uint16_t>((size_t) w16_elems);
+                    q.take<float>((size_t) w32_elems);
+                    q.take<uint8_t>(ws_bytes);
+                    q.take<uint8_t>(gbuf);
+                    if (TT >= kPreMinT) q.take<uint8_t>((size_t) ring_max * gstride);
+                    return p.off + 256 <= lendable && d.off + 256 <= D;
+                };
+                std::string tried;
+                // (STRATA_GLM_PREFILL_DENSE_TIER_MASK=m, a test: only split m - an exact comparison of the split the
+                // long prompts pick on a short prompt's setup)
+                static const int dt_force_m = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER_MASK"); return v ? std::atoi(v) : 0; }();
+                for (int m = 1; m < 8; ++m) {
+                    if (dt_force_m > 0 && m != dt_force_m) continue;
+                    int64_t lo = 1, hi = ceiling / 256, best = 0;
+                    while (lo <= hi) {
+                        const int64_t mid = lo + (hi - lo) / 2;
+                        if (fits(m, mid * 256)) {
+                            best = mid * 256;
+                            lo = mid + 1;
+                        } else {
+                            hi = mid - 1;
+                        }
+                    }
+                    tried += " " + std::to_string(m) + ":" + std::to_string(best);
+                    if (best > T && best > S->T_tier) {
+                        S->T_tier = best;
+                        S->NP_tier = best >= kPreMinT ? ring_max : 0;
+                        S->dt_mask = m;
+                    }
+                }
+                static bool said = false;
+                if (!said || getenv("STRATA_GLM_PREFILL_VERBOSE") != nullptr)
+                    std::fprintf(stderr, "glm prefill: CUDA%d dense tier act test (lend %lld%%): chunk per split (1 per-row, "
+                                         "2 shared, 4 the rest in the dense rows):%s -> %d, plain %lld\n", dev_,
+                                 (long long) pct, tried.c_str(), S->dt_mask, (long long) T);
+                said = true;
             }
         }
         S->keep = keep;
@@ -1476,12 +1536,23 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     // A-21: the dense tier's longer chunk - the pool's tail is the larger of the two layouts' (its activations alone)
     if (S->T_tier > S->T) {
         const auto pt = prefill_bytes_for((size_t) S->T_tier);
+        const int m = S->dt_mask;
         Carve c;
-        c.take<uint8_t>(pt.first + pt.second);
+        if ((m & 3) == 0) c.take<uint8_t>(pt.first + pt.second);
+        else if ((m & 3) != 3) c.take<uint8_t>((m & 1) ? pt.second : pt.first);
+        if (!(m & 4)) {   // (the rest in the pool: as the plain layout, with the tier's prestage)
+            c.take<uint16_t>((size_t) w16_elems);
+            c.take<float>((size_t) w32_elems);
+            c.take<uint8_t>(ws_bytes);
+            c.take<uint8_t>(S->gbuf_bytes);
+            c.take<uint8_t>(F->nv_guard);
+            c.take<uint8_t>((size_t) S->NP_tier * gstride);
+        }
         S->borrow_bytes = std::max(S->borrow_bytes, c.off);
         std::fprintf(stderr, "glm prefill: CUDA%d dense tier: chunks of %lld tokens (%lld without it), %d prestage slots "
-                             "in the dense rows (%d without it)\n", dev_, (long long) S->T_tier, (long long) T,
-                     S->NP_tier, S->NP);
+                             "in the %s (%d without it); in the dense rows:%s%s%s\n", dev_, (long long) S->T_tier, (long long) T,
+                     S->NP_tier, (m & 4) ? "dense rows" : "pool", S->NP, (m & 1) ? " per-row" : "", (m & 2) ? " shared" : "",
+                     (m & 4) ? " the rest" : "");
         S->T = (int) S->T_tier;
     }
     if (cudaHostAlloc((void**) &S->emb_h, (size_t) S->T * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
@@ -1831,17 +1902,26 @@ size_t Glm5Model::prefill_carve(int Tn) {
     // 0xA5 once the region is the prompt's and reports any byte a prompt changed (a write past a buffer, or into it)
     static const size_t guard_b = [] { const char* v = getenv("STRATA_GLM_PREFILL_GUARD_MB"); return v ? (size_t) std::atoll(v) << 20 : 0; }();
     S->guards.clear();
-    if (guard_b) S->guards.push_back({c.take<uint8_t>(guard_b), guard_b, "pool: before the activations"});
-    S->arena = c.take<uint8_t>(pers + uni);
-    if (guard_b) S->guards.push_back({c.take<uint8_t>(guard_b), guard_b, "pool: after the activations"});
     // A-21: a chunk longer than the plain layout's takes its other buffers from the dense rows (dt_build's range
     // before the one-layer buffer); the pool lends the activations alone
     // (=2: every prompt, a short one too - the same chunks as without it, for an exact comparison)
     static const bool dt_force = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER"); return v != nullptr && std::atoi(v) >= 2; }();   // (=3: the same, chunks kept at T_base - prefill())
     S->dt_on = dt_ready_ && S->T_tier > 0 && (Tn > S->T_base || dt_force);
-    Carve dc{(uint8_t*) w_arena_};
-    Carve& o = S->dt_on ? dc : c;
-    if (guard_b) S->guards.push_back({o.take<uint8_t>(guard_b), guard_b, S->dt_on ? "dense: before w16" : "pool: before w16"});
+    Carve dc{(uint8_t*) w_arena_ + dt_lo_};
+    // (STRATA_GLM_PREFILL_DENSE_TIER_ACT: the split choose picked - dt_mask's bits put a part in the dense rows)
+    const int dm = S->dt_on ? S->dt_mask : 0;
+    uint8_t* uni_at = nullptr;
+    S->pers_bytes = pers;
+    if (guard_b) S->guards.push_back({c.take<uint8_t>(guard_b), guard_b, "pool: before the activations"});
+    if ((dm & 3) == 0) {
+        S->arena = c.take<uint8_t>(pers + uni);
+    } else {
+        S->arena = ((dm & 1) ? dc : c).take<uint8_t>(pers);
+        uni_at = ((dm & 2) ? dc : c).take<uint8_t>(uni);
+    }
+    if (guard_b) S->guards.push_back({c.take<uint8_t>(guard_b), guard_b, "pool: after the activations"});
+    Carve& o = (dm & 4) ? dc : c;
+    if (guard_b) S->guards.push_back({o.take<uint8_t>(guard_b), guard_b, (dm & 4) ? "dense: before w16" : "pool: before w16"});
     S->w16 = o.take<uint16_t>((size_t) S->w16_elems);
     S->w32 = o.take<float>((size_t) S->w32_elems);
     S->ws = o.take<uint8_t>(S->ws_bytes);
@@ -1858,9 +1938,9 @@ size_t Glm5Model::prefill_carve(int Tn) {
         S->pbuf_carved = slots * S->gstride;
     }
     S->pbuf = S->pbuf_carved ? o.take<uint8_t>(S->pbuf_carved + F->nv_guard) : nullptr;   // (a short prompt: none)
-    if (guard_b) S->guards.push_back({o.take<uint8_t>(guard_b), guard_b, S->dt_on ? "dense: after pbuf" : "pool: after pbuf"});
+    if (guard_b) S->guards.push_back({o.take<uint8_t>(guard_b), guard_b, (dm & 4) ? "dense: after pbuf" : "pool: after pbuf"});
     S->dt_used = S->dt_on ? dc.off : 0;
-    if (S->dt_on && dc.off > dt_buf_at_) {   // (choose sized it to fit: a guard, not a path)
+    if (S->dt_on && dc.off > dt_buf_at_ - dt_lo_) {   // (choose sized it to fit: a guard, not a path)
         std::fprintf(stderr, "glm prefill: CUDA%d dense tier: %zu MB of buffers past the dense rows' %llu MB - off\n",
                      dev_, dc.off >> 20, (unsigned long long) (dt_buf_at_ >> 20));
         dt_ready_ = false;
@@ -1886,7 +1966,9 @@ size_t Glm5Model::prefill_carve(int Tn) {
     S->hy4_keep = g.is_hy4() ? a.take<uint8_t>(hy4_prompt_bytes(T).first)
                   : g.ink    ? a.take<uint8_t>(ink_prompt_bytes(T).first)   // (inkling: its residual rows)
                              : nullptr;
-    S->uni = S->arena + a.off;
+    if (uni_at != nullptr && a.off > pers)   // (prefill_bytes_for sized the per-row part: a guard, not a path)
+        std::fprintf(stderr, "glm prefill: CUDA%d dense tier act: the per-row buffers take %zu bytes of %zu\n", dev_, a.off, pers);
+    S->uni = uni_at != nullptr ? uni_at : S->arena + a.off;
     S->uni_bytes = uni;
     cublasSetWorkspace(S->blas, S->ws, S->ws_bytes);
     S->T_bound = Tn;
@@ -2266,7 +2348,29 @@ bool Glm5Model::dt_build(std::string& why) {
         return false;
     }
     const int NL = (int) F->L.size();
+    // the range starts at the first blk row: the arena's leading non-blk raw rows (qwen35moe: output.weight) stay put
+    // (dt_lo_ past them; a second dt_build finds dt_rows_ already trimmed to start there)
     uint64_t end = 0;
+    if (dt_rows_[0].il >= 0 && dt_rows_[0].at == dt_lo_) {
+        end = dt_lo_;
+    } else {
+        // (the rows go in arena order; whatever lies before the first blk row - noted or not - is not lent)
+        size_t i0 = 0;
+        while (i0 < dt_rows_.size() && dt_rows_[i0].il < 0) ++i0;
+        if (i0 < dt_rows_.size()) end = dt_rows_[i0].at;
+        if (i0 == dt_rows_.size() || (i0 > 0 && dt_rows_[i0].at < dt_rows_[i0 - 1].at + dt_rows_[i0 - 1].n)) {
+            why = "the arena does not start with a layer's raw row (" + dt_rows_[0].name + ")";
+            for (size_t k = 0; k < dt_rows_.size() && k < 12; ++k)
+                why += (k ? ", " : ": ") + dt_rows_[k].name + " @" + std::to_string(dt_rows_[k].at >> 20) + "+" +
+                       std::to_string(dt_rows_[k].n >> 20) + " MB";
+            return false;
+        }
+        if (i0 > 0)
+            std::fprintf(stderr, "glm prefill: CUDA%d dense tier: the first %zu raw rows (%s, %.0f MB) are not a layer's - "
+                                 "the range starts past them\n", dev_, i0, dt_rows_[0].name.c_str(), (double) end / 1048576.0);
+        dt_rows_.erase(dt_rows_.begin(), dt_rows_.begin() + (std::ptrdiff_t) i0);
+        dt_lo_ = end;
+    }
     size_t nrow = 0;
     for (const auto& r : dt_rows_) {
         if (r.at != end || r.il < 0 || r.il >= NL) break;
@@ -2294,14 +2398,14 @@ bool Glm5Model::dt_build(std::string& why) {
         il_hi = std::max(il_hi, r.il);
     }
     const uint64_t lmax = *std::max_element(lay_bytes.begin(), lay_bytes.end());
-    if (lmax * 4 > end) {
-        why = "too few rows to lend (" + std::to_string(end >> 20) + " MB, a layer " + std::to_string(lmax >> 20) + " MB)";
+    if (lmax * 4 > end - dt_lo_) {
+        why = "too few rows to lend (" + std::to_string((end - dt_lo_) >> 20) + " MB, a layer " + std::to_string(lmax >> 20) + " MB)";
         return false;
     }
     dt_buf_at_ = end - lmax;
     dt_buf_bytes_ = lmax;
     // F->L[il]'s pointer words into the range: each must point into one of layer il's own rows
-    const uintptr_t base = (uintptr_t) w_arena_, top = base + end;
+    const uintptr_t base = (uintptr_t) w_arena_, top = base + end, lo_p = base + dt_lo_;
     const auto row_of = [&](uint64_t a) -> int {   // the row whose start is the last at or below a
         size_t lo = 0, hi = nrow;
         while (hi - lo > 1) {
@@ -2317,7 +2421,7 @@ bool Glm5Model::dt_build(std::string& why) {
         for (size_t off = 0; off + sizeof(uintptr_t) <= sizeof(FastState::Layer); off += alignof(void*)) {
             uintptr_t v;
             std::memcpy(&v, p + off, sizeof v);
-            if (v < base || v >= top) continue;
+            if (v < lo_p || v >= top) continue;
             const uint64_t a = (uint64_t) (v - base);
             const int ri = row_of(a);
             if (ri < 0 || a >= dt_rows_[(size_t) ri].at + dt_rows_[(size_t) ri].n) {
@@ -2338,7 +2442,7 @@ bool Glm5Model::dt_build(std::string& why) {
         for (size_t off = 0; off + sizeof(uintptr_t) <= sizeof(FastState); off += alignof(void*)) {
             uintptr_t v;
             std::memcpy(&v, p + off, sizeof v);
-            if (v >= base && v < top) {
+            if (v >= lo_p && v < top) {
                 why = "the fast state holds a pointer into the rows (offset " + std::to_string(off) + ")";
                 return false;
             }
@@ -2362,7 +2466,7 @@ bool Glm5Model::dt_build(std::string& why) {
     std::string ks;
     for (size_t i = 0; i < kv.size() && i < 8; ++i) ks += " | " + kv[i].second + " " + std::to_string(kv[i].first >> 20) + " MB";
     std::fprintf(stderr, "glm prefill: CUDA%d dense tier: %.2f GB of %zu rows (layers %d-%d, up to %s) lendable, a layer's "
-                         "buffer %.0f MB, %zu pointers moved per layer pass:%s\n", dev_, (double) end / 1073741824.0,
+                         "buffer %.0f MB, %zu pointers moved per layer pass:%s\n", dev_, (double) (end - dt_lo_) / 1073741824.0,
                  nrow, il_lo, il_hi, stop.c_str(), (double) lmax / 1048576.0, npatch, ks.c_str());
     dt_cur_ = -1;
     dt_ready_ = true;
@@ -2445,8 +2549,8 @@ void Glm5Model::a21_test_hooks(bool before) {
     const cudaStream_t s = F->cs;
     cudaDeviceSynchronize();
     std::vector<PrefillState::Guard> gs = S->guards;
-    if (S->dt_on && S->dt_used < dt_buf_at_ && guards)
-        gs.push_back({(uint8_t*) w_arena_ + S->dt_used, (size_t) (dt_buf_at_ - S->dt_used), "dense: the unused gap before the buffer"});
+    if (S->dt_on && S->dt_used < dt_buf_at_ - dt_lo_ && guards)
+        gs.push_back({(uint8_t*) w_arena_ + dt_lo_ + S->dt_used, (size_t) (dt_buf_at_ - dt_lo_ - S->dt_used), "dense: the unused gap before the buffer"});
     const auto where = [&](const void* p) {
         const uint8_t* q = (const uint8_t*) p;
         char b[96];
@@ -2488,13 +2592,18 @@ void Glm5Model::a21_test_hooks(bool before) {
                          (double) S->dt_used / 1048576.0, (double) dt_buf_at_ / 1048576.0, (double) dt_buf_bytes_ / 1048576.0);
             slots("before");
         }
-        if (fill >= 1 && S->dt_on) cudaMemsetAsync(w_arena_, 0xFF, (size_t) dt_buf_at_, s);
-        if (fill >= 2) cudaMemsetAsync(S->arena, 0xFF, (size_t) (S->uni + S->uni_bytes - S->arena), s);
+        if (fill >= 1 && S->dt_on) cudaMemsetAsync((uint8_t*) w_arena_ + dt_lo_, 0xFF, (size_t) (dt_buf_at_ - dt_lo_), s);
+        if (fill >= 2 && S->uni >= S->arena && S->uni <= S->arena + S->pers_bytes + 256)
+            cudaMemsetAsync(S->arena, 0xFF, (size_t) (S->uni + S->uni_bytes - S->arena), s);
+        else if (fill >= 2) {   // (the act test's split: the two parts apart)
+            cudaMemsetAsync(S->arena, 0xFF, S->pers_bytes, s);
+            cudaMemsetAsync(S->uni, 0xFF, S->uni_bytes, s);
+        }
         for (const auto& gd : gs) cudaMemsetAsync(gd.p, 0xA5, gd.n, s);
         cudaStreamSynchronize(s);
         if (fill || guards)
             std::fprintf(stderr, "glm a21 test: fill %d (dense %.1f MB%s), %zu guards set\n", fill,
-                         S->dt_on ? (double) dt_buf_at_ / 1048576.0 : 0.0, fill >= 2 ? " + the activations" : "", gs.size());
+                         S->dt_on ? (double) (dt_buf_at_ - dt_lo_) / 1048576.0 : 0.0, fill >= 2 ? " + the activations" : "", gs.size());
         return;
     }
     std::vector<uint8_t> h;
@@ -6450,7 +6559,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             S->mark("mtp_rows", s);
         }
     }
-    if (mtp_il_ >= 0 && next_ids != nullptr && kv_cut < 0) {
+    // (A-21 test: scoring the prompt path on qwen35moe skips the block's rows - they combine the last FFN into R in
+    // place, which the score's head reads after the chunk)
+    if (mtp_il_ >= 0 && next_ids != nullptr && kv_cut < 0 && !(g.qwen35() && prefill_logits)) {
         int Tv = 0;   // rows whose next token is known (all but possibly the prompt's last)
         while (Tv < T && next_ids[Tv] >= 0) ++Tv;
         if (g.qwen35() && Tv > 0) {
@@ -6618,8 +6729,8 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     int64_t min_n = 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if (!prefill_logits && (int64_t) tokens.size() < min_n) return false;
-    if (prefill_logits && (!(g_.v41 || g_.ink) || split_next_ || l0_ != 0 || l1_ != g_.n_layers)) {
-        err = "prefill logits requires single-device DeepSeek V4.1 or Inkling"; return false;
+    if (prefill_logits && (!(g_.v41 || g_.ink || (g_.qwen35() && !g_.q4x && !g_.q35_dense())) || split_next_ || l0_ != 0 || l1_ != g_.n_layers)) {
+        err = "prefill logits requires single-device DeepSeek V4.1, Inkling or qwen35moe"; return false;
     }
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
@@ -6833,6 +6944,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         gf::rms_q8(const_cast<float*>(ink_prompt_final()) + (size_t) t * E, nullptr,
                                    w_.at("output_norm.weight"), g.norm_eps, E, fast_->head_x, fast_->head_xq,
                                    fast_->cs);
+                    else if (g.qwen35())   // (A-21 test, qwen35moe: output_norm(R + the last layer's FFN) a row - R is
+                                           // the chunk's scratch, the next chunk embeds it again)
+                        gf::rms_q8(pf_->R + (size_t) t * 4 * E, pf_->ffn + (size_t) t * E, w_.at("output_norm.weight"),
+                                   g.norm_eps, E, fast_->head_x, fast_->head_xq, fast_->cs);
                     else
                     d41::head_prep(pf_->R + (size_t) t * 4 * E, pf_->pre2 + (size_t) t * 4,
                                    w_.at("output_norm.weight"), g.norm_eps, E,

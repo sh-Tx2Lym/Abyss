@@ -3862,6 +3862,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // dense.bin is mapped for the BF16 rows' source
     static const bool dt_env = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER"); return v != nullptr && std::atoi(v) != 0; }();
     dt_rows_.clear();
+    dt_host_.clear();
 #if !defined(_WIN32)
     if (dt_env && dt_dense_map_ == nullptr) {
         const int fd = ::open((pack_dir + "/dense.bin").c_str(), O_RDONLY);
@@ -4109,6 +4110,13 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                             cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
         w_[r.name] = (const float*) ((uint8_t*) w_arena_ + at);
         ws_map_[r.name] = strata::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr, 0, 0};
+        // A-21: a layer's row converted here (qwen35moe: norms, the router, the delta-net's small rows - between its raw
+        // rows) is restorable from a host copy of what went up
+        if (dt_env && r.name.rfind("blk.", 0) == 0) {
+            const uint8_t* hb = (const uint8_t*) host.data();
+            dt_host_.emplace_back(hb, hb + (size_t) n_f32 * 4);
+            dt_note(r.name, at, n_f32 * 4, dt_host_.back().data());
+        }
         at += (n_f32 * 4 + 255u) & ~(uint64_t) 255u;
     }
 
