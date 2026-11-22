@@ -385,6 +385,26 @@ private:
     std::map<std::string, const float*> w_;       // name -> device pointer (the weights arena)
     float* w_arena_ = nullptr;
     uint64_t w_arena_bytes_ = 0;                           // (the VRAM report at load)
+    // A-21 (STRATA_GLM_PREFILL_DENSE_TIER=1, deepseek41, one device): while a long prompt runs, the dense rows at the
+    // start of w_arena_ (raw copies of the shard / dense.bin mapping) are lent to the prompt path's scratch; each layer's
+    // rows are copied into a one-layer buffer before that layer runs, F->L[il]'s pointers moved there, and all rows
+    // copied back to their own addresses before the decode (which then needs no change)
+    struct DtRow { int il; uint64_t at, n; const uint8_t* src; std::string name; };
+    struct DtPatch { uint32_t off; uintptr_t orig, moved; };   // a pointer word inside F->L[il]: its two values
+    std::vector<DtRow> dt_rows_;                           // every raw row uploaded (pack), in arena order
+    uint64_t dt_end_ = 0;                                  // [0, dt_end_) of w_arena_: restorable blk rows only
+    uint64_t dt_buf_at_ = 0, dt_buf_bytes_ = 0;            // the one-layer buffer at the end of that range
+    std::vector<std::vector<int>> dt_layer_rows_;          // per layer: its rows (indices into dt_rows_)
+    std::vector<std::vector<DtPatch>> dt_patch_;           // per layer: the pointer words to move
+    bool dt_ready_ = false;                                // dt_build passed every check
+    int dt_cur_ = -1;                                      // the layer whose rows the buffer holds (patched)
+    uint8_t* dt_pin_ = nullptr;                            // pinned bounce for one layer's rows
+    cudaEvent_t dt_ev_ = nullptr;                          // ... its last copy
+    const uint8_t* dt_dense_map_ = nullptr;                // dense.bin mapped (the BF16 rows' source)
+    size_t dt_dense_map_bytes_ = 0;
+    bool dt_build(std::string& why);                       // (prefill_setup) the rows, the buffer, the patches
+    bool dt_layer_in(int il, cudaStream_t s, std::string& err);   // (prefill_half) layer il's rows -> the buffer
+    bool dt_restore(std::string& err);                     // (prefill_return) all rows home, F->L back
     // state and scratch arenas (device), carved in load(); see glm_model.cpp for the layout
     float* state_ = nullptr;
     uint64_t state_bytes_ = 0;

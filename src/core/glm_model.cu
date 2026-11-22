@@ -3858,6 +3858,29 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     uint64_t at = 0;
     std::vector<float> host;
     std::vector<uint8_t> raw;
+    // A-21 (STRATA_GLM_PREFILL_DENSE_TIER=1): every row copied raw from a mapping is noted (prefill's dense tier);
+    // dense.bin is mapped for the BF16 rows' source
+    static const bool dt_env = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER"); return v != nullptr && std::atoi(v) != 0; }();
+    dt_rows_.clear();
+#if !defined(_WIN32)
+    if (dt_env && dt_dense_map_ == nullptr) {
+        const int fd = ::open((pack_dir + "/dense.bin").c_str(), O_RDONLY);
+        struct stat st{};
+        if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
+            void* m = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (m != MAP_FAILED) {
+                dt_dense_map_ = (const uint8_t*) m;
+                dt_dense_map_bytes_ = (size_t) st.st_size;
+            }
+        }
+        if (fd >= 0) ::close(fd);
+    }
+#endif
+    const auto dt_note = [&](const std::string& name, uint64_t at_, uint64_t n, const uint8_t* src) {
+        if (!dt_env || src == nullptr) return;
+        const int il = name.rfind("blk.", 0) == 0 ? std::atoi(name.c_str() + 4) : -1;
+        dt_rows_.push_back({il, at_, n, src, name});
+    };
     for (const auto& r : rows) {
         if (!row_in_range(r.name)) continue;   // the other half's rows live on the other device
         if (r.kind == "x") {
@@ -3960,6 +3983,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
             w8_[r.name] = (const void*) ((uint8_t*) w_arena_ + at);
+            dt_note(r.name, at, nbytes, src);
             at += (nbytes + 255u) & ~(uint64_t) 255u;
             continue;
         }
@@ -3977,6 +4001,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             }
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
+            if (dt_dense_map_ != nullptr && r.offset + r.bytes <= dt_dense_map_bytes_)
+                dt_note(r.name, at, r.bytes, dt_dense_map_ + r.offset);
             // deepseek4: a projection the GEMVs serve (the compressors', the indexer's q_b) that the GGUF stored as F16
             // comes as a BF16 row (iq_pack.py --compat-bf16) and runs on the BF16 GEMV
             // hy4: a projection a GGUF keeps in BF16 (the llama.cpp-fork conversions) runs on the BF16 GEMV too
@@ -3997,6 +4023,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
             wi32_[r.name] = (const int*) ((uint8_t*) w_arena_ + at);
+            dt_note(r.name, at, nbytes, src);
             at += (nbytes + 255u) & ~(uint64_t) 255u;
             continue;
         }
@@ -4017,6 +4044,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 pack_emb_src_ = src;
                 pack_emb_type_ = (int) ti->type;
             }
+            dt_note(r.name, at, nbytes, src);
             at += (nbytes + 255u) & ~(uint64_t) 255u;
             continue;
         }
