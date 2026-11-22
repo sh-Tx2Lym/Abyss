@@ -2386,11 +2386,15 @@ bool Glm5Model::dt_layer_in(int il, cudaStream_t s, std::string& err) {
     // not change against the overlapped run (no stream but s reads a layer's dense rows)
     static const bool dt_sync = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER_SYNC"); return v != nullptr && std::atoi(v) != 0; }();
     if (dt_sync && !glmfast::cuda_ok(cudaDeviceSynchronize(), "glm dense tier: the sync test", err)) return false;
+    // STRATA_GLM_PREFILL_DENSE_TIER_STUB=1 (a timing test, the answers are garbage): the host's copies into the bounce
+    // skipped - the upload and its event stay - so the time is the tier's with free host copies (what reading ahead
+    // into a second bounce could win back at most).  The rows still go home from the mapping: the decode is whole
+    static const bool dt_stub = [] { const char* v = getenv("STRATA_GLM_PREFILL_DENSE_TIER_STUB"); return v != nullptr && std::atoi(v) != 0; }();
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t off = 0;
     for (const int ri : dt_layer_rows_[(size_t) il]) {
         const auto& r = dt_rows_[(size_t) ri];
-        std::memcpy(dt_pin_ + off, r.src, (size_t) r.n);
+        if (!dt_stub) std::memcpy(dt_pin_ + off, r.src, (size_t) r.n);
         off += (r.n + 255u) & ~(uint64_t) 255u;
     }
     g_dt_host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
