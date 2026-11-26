@@ -57,4 +57,16 @@ inline int draft_kmax(int kmax, long long p, long long max_ctx) {
     return (int) std::max(0LL, std::min<long long>(kmax, left));
 }
 
+// The largest prompt chunk in tokens: --prefill auto's limit on one GPU, the tier's (dt_chunk), and the cap on a
+// hand-given --prefill N.  STRATA_GLM_PREFILL_MAX, default 32768, taken down to the 256-token grid; at most 65280, the
+// largest such chunk under 65536 (many prompt kernels carry the chunk's token count in gridDim.y/z, whose 65535 a
+// chunk of 65536 or more passes - the launch fails).
+inline long long prefill_chunk_max() {
+    static const long long v = [] {
+        const long long x = (long long) env_num("STRATA_GLM_PREFILL_MAX", 32768, 256, 65280);
+        return x / 256 * 256;
+    }();
+    return v;
+}
+
 }  // namespace strata::core

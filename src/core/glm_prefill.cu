@@ -1474,17 +1474,21 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     // STRATA_GLM_PREFILL_MB=<MB> fixes what may be lent.
     const std::string mode = prefill_mode();
     const bool is_auto = mode == "auto";
-    const int64_t auto_max = n_parts_ == 1 ? 32768 : 8192;
+    // (the one-GPU limit and the cap on a hand-given N: STRATA_GLM_PREFILL_MAX, default 32768, prefill_chunk_max)
+    const int64_t chunk_max = (int64_t) prefill_chunk_max();
+    const int64_t auto_max = n_parts_ == 1 ? chunk_max : std::min<int64_t>(8192, chunk_max);
     int64_t ceiling = is_auto ? auto_max : (int64_t) std::atoll(mode.c_str());
-    // (a hand-given N is held to 32768, the auto limit: many prompt kernels carry the chunk's token count in
+    // (a hand-given N is held to the same limit: many prompt kernels carry the chunk's token count in
     // gridDim.y/z, whose 65535 a chunk of 65536 or more passes - the launch fails)
-    if (ceiling > 32768) {
+    if (ceiling > chunk_max) {
         static bool noted = false;
-        if (!noted) std::fprintf(stderr, "NOTE: --prefill %lld is over 32768, the largest prompt chunk - using 32768\n",
-                                 (long long) ceiling);
+        if (!noted) std::fprintf(stderr, "NOTE: --prefill %lld is over %lld, the largest prompt chunk - using %lld\n",
+                                 (long long) ceiling, (long long) chunk_max, (long long) chunk_max);
         noted = true;
-        ceiling = 32768;
+        ceiling = chunk_max;
     }
+    if (is_auto && n_parts_ == 1 && chunk_max != 32768)
+        std::fprintf(stderr, "glm prefill: CUDA%d chunk limit %lld (STRATA_GLM_PREFILL_MAX)\n", dev_, (long long) chunk_max);
     // the pool to come: `per` slots a layer over the tier layers, as fast_setup sizes it from the same free VRAM
     size_t dev_free = 0, dev_total = 0;
     cudaMemGetInfo(&dev_free, &dev_total);
@@ -1539,7 +1543,8 @@ bool Glm5Model::prefill_setup(std::string& err, int per_pool) {
     // KL 0.0081 against 0.0079 for the three chunks, two runs of the same path 0.0070 apart (bench/p1chunk).
     // Below 90% of the experts held pinned, prefill_settle goes back to 4096.  =4096: the old chunks
     // (prefill_settle takes it back to 4096 where the tiers leave experts on the disk)
-    S->small_below = 32768;
+    // (follows the chunk limit, STRATA_GLM_PREFILL_MAX: a full keep that falls short of it tries the small one)
+    S->small_below = (int64_t) prefill_chunk_max();
     if (const char* v = getenv("STRATA_GLM_PREFILL_SMALL_BELOW")) {
         S->small_below = std::max<int64_t>(0, std::atoll(v));
         S->small_below_env = true;
@@ -2802,14 +2807,14 @@ bool Glm5Model::dt_fits(int T, int& place) const {
     return true;
 }
 
-// the longest chunk (256-token grid, up to --prefill auto's 32768) the tier lays out; 0: none longer than the plain one
+// the longest chunk (256-token grid, up to --prefill auto's limit, prefill_chunk_max) the tier lays out; 0: none longer than the plain one
 int Glm5Model::dt_chunk() {
     PrefillState* S = pf_;
     if (S == nullptr || dt_ == nullptr) return 0;
     if (S->dt_T >= 0) return S->dt_T;
     S->dt_T = 0;
     if (S->mode.rfind("auto", 0) != 0) return 0;   // (--prefill N: the operator's chunk)
-    int lo = S->T / 256 + 1, hi = 32768 / 256, best = 0, pl = 0;
+    int lo = S->T / 256 + 1, hi = (int) (prefill_chunk_max() / 256), best = 0, pl = 0;
     while (lo <= hi) {
         const int mid = lo + (hi - lo) / 2;
         if (dt_fits(mid * 256, pl)) {

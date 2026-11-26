@@ -5187,12 +5187,14 @@ int main(int argc, char** argv) {
             o.prefill_arg = v;
             o.prefill_auto = v == "auto";
             o.prefill_chunk = o.prefill_auto ? 8192 : std::atoll(v.c_str());
-            // (held to 32768, the engine's auto limit: prompt kernels carry the chunk's token count in gridDim.y/z,
-            // and a chunk of 65536 or more fails the launch; the engine reads the clamped number from prefill_arg)
-            if (o.prefill_chunk > 32768) {
-                std::fprintf(stderr, "NOTE: --prefill %s is over 32768, the largest prompt chunk - using 32768\n", v.c_str());
-                o.prefill_chunk = 32768;
-                o.prefill_arg = "32768";
+            // (held to the engine's chunk limit, STRATA_GLM_PREFILL_MAX, default 32768, at most 65280: prompt kernels
+            // carry the chunk's token count in gridDim.y/z, and a chunk of 65536 or more fails the launch; the engine
+            // reads the clamped number from prefill_arg)
+            const long long cmax = strata::core::prefill_chunk_max();
+            if (o.prefill_chunk > cmax) {
+                std::fprintf(stderr, "NOTE: --prefill %s is over %lld, the largest prompt chunk - using %lld\n", v.c_str(), cmax, cmax);
+                o.prefill_chunk = cmax;
+                o.prefill_arg = std::to_string(cmax);
             }
         }
         else if (a == "--parallel") o.parallel_arg = next("--parallel");
